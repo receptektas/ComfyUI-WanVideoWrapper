@@ -189,96 +189,91 @@ class WanVideoTextEncodeCached:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-            "model_name": (folder_paths.get_filename_list("text_encoders"), {"tooltip": "These models are loaded from 'ComfyUI/models/text_encoders'"}),
-            "precision": (["fp32", "bf16"],
-                    {"default": "bf16"}
-                ),
-            "positive_prompt": ("STRING", {"default": "", "multiline": True} ),
-            "negative_prompt": ("STRING", {"default": "", "multiline": True} ),
-            "quantization": (['disabled', 'fp8_e4m3fn'], {"default": 'disabled', "tooltip": "optional quantization method"}),
-            "use_disk_cache": ("BOOLEAN", {"default": True, "tooltip": "Cache the text embeddings to disk for faster re-use, under the custom_nodes/ComfyUI-WanVideoWrapper/text_embed_cache directory"}),
-            "device": (["gpu", "cpu"], {"default": "gpu", "tooltip": "Device to run the text encoding on."}),
+            "positive_prompt": ("STRING", {"default": "", "multiline": True}),
+            "negative_prompt": ("STRING", {"default": "", "multiline": True}),
+            "use_disk_cache": ("BOOLEAN", {"default": True, "tooltip": "Cache the text embeddings to disk for faster re-use"}),
+            "device": (["gpu", "cpu"], {"default": "gpu", "tooltip": "Device to run the text encoding on"}),
             },
             "optional": {
-                "extender_args": ("WANVIDEOPROMPTEXTENDER_ARGS", {"tooltip": "Use this node to extend the prompt with additional text."}),
+                "text_encoder_model": ("WANTEXTENCODER", {"tooltip": "Pre-loaded T5 text encoder from 'WanVideo T5 Text Encoder Loader' node"}),
+                "extender_args": ("WANVIDEOPROMPTEXTENDER_ARGS", {"tooltip": "Use this to extend the prompt with additional text"}),
+                "precision": (["fp32", "bf16"], {"default": "bf16", "tooltip": "Precision for prompt extender (if used)"}),
             }
         }
 
     RETURN_TYPES = ("WANVIDEOTEXTEMBEDS", "WANVIDEOTEXTEMBEDS", "STRING")
     RETURN_NAMES = ("text_embeds", "negative_text_embeds", "positive_prompt")
-    OUTPUT_TOOLTIPS = ("The text embeddings for both prompts", "The text embeddings for the negative prompt only (for NAG)", "Positive prompt to display prompt extender results")
+    OUTPUT_TOOLTIPS = ("Text embeddings for both prompts", "Text embeddings for negative prompt only (for NAG)", "Positive prompt to display prompt extender results")
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
-    DESCRIPTION = """Encodes text prompts into text embeddings. This node loads and completely unloads the T5 after done,  
-leaving no VRAM or RAM imprint. If prompts have been cached before T5 is not loaded at all.  
-negative output is meant to be used with NAG, it contains only negative prompt embeddings.  
-
-Additionally you can provide a Qwen LLM model to extend the positive prompt with either one  
-of the original Wan templates or a custom system prompt.  
+    DESCRIPTION = """Encodes text prompts into text embeddings with disk caching support.
+If prompts have been cached before, text encoder is not needed.
+Use 'WanVideo T5 Text Encoder Loader' node to load the text encoder model.
+Negative output is meant to be used with NAG, it contains only negative prompt embeddings.
 """
 
-
-    def process(self, model_name, precision, positive_prompt, negative_prompt, quantization='disabled', use_disk_cache=True, device="gpu", extender_args=None):
-        from .nodes_model_loading import LoadWanVideoT5TextEncoder
+    def process(self, positive_prompt, negative_prompt, use_disk_cache=True, device="gpu", text_encoder_model=None, extender_args=None, precision="bf16"):
         pbar = ProgressBar(3)
+        echoshot = "[1]" in positive_prompt
 
-        echoshot = True if "[1]" in positive_prompt else False
-
-        # Handle prompt extension with in-memory cache
-        orig_prompt = positive_prompt
         if extender_args is not None:
-            extender_key = (orig_prompt, str(extender_args))
-            if extender_key in _extender_cache:
-                positive_prompt = _extender_cache[extender_key]
-                log.info(f"Loaded extended prompt from in-memory cache: {positive_prompt}")
-            else:
-                from .qwen.qwen import QwenLoader, WanVideoPromptExtender
-                log.info("Using WanVideoPromptExtender to process prompts")
-                qwen, = QwenLoader().load(
-                    extender_args["model"], 
-                    load_device="main_device" if device == "gpu" else "cpu", 
-                    precision=precision)
-                positive_prompt, = WanVideoPromptExtender().generate(
-                    qwen=qwen,
-                    max_new_tokens=extender_args["max_new_tokens"],
-                    prompt=orig_prompt,
-                    device=device,
-                    force_offload=False,
-                    custom_system_prompt=extender_args["system_prompt"],
-                    seed=extender_args["seed"]
-                )
-                log.info(f"Extended positive prompt: {positive_prompt}")
-                _extender_cache[extender_key] = positive_prompt
-                del qwen
-            pbar.update(1)
+            positive_prompt = self._extend_prompt(positive_prompt, extender_args, precision, device)
+        pbar.update(1)
 
-        # Now check disk cache using the (possibly extended) prompt
         if use_disk_cache:
             context, context_null = get_cached_text_embeds(positive_prompt, negative_prompt)
             if context is not None and context_null is not None:
-                return{
+                return {
                     "prompt_embeds": context,
                     "negative_prompt_embeds": context_null,
                     "echoshot": echoshot,
-                },{"prompt_embeds": context_null}, positive_prompt
+                }, {"prompt_embeds": context_null}, positive_prompt
 
-        t5, = LoadWanVideoT5TextEncoder().loadmodel(model_name, precision, "main_device", quantization)
-        pbar.update(1)
+        if text_encoder_model is None:
+            raise ValueError("Text encoder model is required when cache is not available. Connect 'WanVideo T5 Text Encoder Loader' node.")
 
         prompt_embeds_dict, = WanVideoTextEncode().process(
             positive_prompt=positive_prompt,
             negative_prompt=negative_prompt,
-            t5=t5,
+            t5=text_encoder_model,
             force_offload=False,
             model_to_offload=None,
             use_disk_cache=use_disk_cache,
             device=device
         )
         pbar.update(1)
-        del t5
+        
         mm.soft_empty_cache()
-        gc.collect() 
+        gc.collect()
         return (prompt_embeds_dict, {"prompt_embeds": prompt_embeds_dict["negative_prompt_embeds"]}, positive_prompt)
+
+    def _extend_prompt(self, prompt, extender_args, precision, device):
+        extender_key = (prompt, str(extender_args))
+        if extender_key in _extender_cache:
+            log.info(f"Loaded extended prompt from in-memory cache: {_extender_cache[extender_key]}")
+            return _extender_cache[extender_key]
+
+        from .qwen.qwen import QwenLoader, WanVideoPromptExtender
+        log.info("Using WanVideoPromptExtender to process prompts")
+        
+        qwen, = QwenLoader().load(
+            extender_args["model"],
+            load_device="main_device" if device == "gpu" else "cpu",
+            precision=precision
+        )
+        extended_prompt, = WanVideoPromptExtender().generate(
+            qwen=qwen,
+            max_new_tokens=extender_args["max_new_tokens"],
+            prompt=prompt,
+            device=device,
+            force_offload=False,
+            custom_system_prompt=extender_args["system_prompt"],
+            seed=extender_args["seed"]
+        )
+        log.info(f"Extended positive prompt: {extended_prompt}")
+        _extender_cache[extender_key] = extended_prompt
+        del qwen
+        return extended_prompt
 
 #region TextEncode
 class WanVideoTextEncode:
@@ -2267,10 +2262,33 @@ class WanVideoEncode:
 
         return ({"samples": latents, "noise_mask": mask},)
 
+class WanVideoLoadTextEncoder:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model_name": (folder_paths.get_filename_list("text_encoders"), {"tooltip": "T5 text encoder models from 'ComfyUI/models/text_encoders'"}),
+                "precision": (["fp32", "bf16"], {"default": "bf16"}),
+                "quantization": (['disabled', 'fp8_e4m3fn'], {"default": 'disabled', "tooltip": "Optional quantization method"}),
+            }
+        }
+
+    RETURN_TYPES = ("WANTEXTENCODER",)
+    RETURN_NAMES = ("text_encoder_model",)
+    FUNCTION = "load"
+    CATEGORY = "WanVideoWrapper"
+    DESCRIPTION = "Loads T5 text encoder model for WanVideo text encoding nodes"
+
+    def load(self, model_name, precision, quantization):
+        from .nodes_model_loading import LoadWanVideoT5TextEncoder
+        t5, = LoadWanVideoT5TextEncoder().loadmodel(model_name, precision, "main_device", quantization)
+        return (t5,)
+
 NODE_CLASS_MAPPINGS = {
     "WanVideoDecode": WanVideoDecode,
     "WanVideoTextEncode": WanVideoTextEncode,
     "WanVideoTextEncodeSingle": WanVideoTextEncodeSingle,
+    "WanVideoLoadTextEncoder": WanVideoLoadTextEncoder,
     "WanVideoClipVisionEncode": WanVideoClipVisionEncode,
     "WanVideoImageToVideoEncode": WanVideoImageToVideoEncode,
     "WanVideoEncode": WanVideoEncode,
@@ -2313,6 +2331,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoDecode": "WanVideo Decode",
     "WanVideoTextEncode": "WanVideo TextEncode",
     "WanVideoTextEncodeSingle": "WanVideo TextEncodeSingle",
+    "WanVideoLoadTextEncoder": "WanVideo Load Text Encoder",
     "WanVideoTextImageEncode": "WanVideo TextImageEncode (IP2V)",
     "WanVideoClipVisionEncode": "WanVideo ClipVision Encode",
     "WanVideoImageToVideoEncode": "WanVideo ImageToVideo Encode",
