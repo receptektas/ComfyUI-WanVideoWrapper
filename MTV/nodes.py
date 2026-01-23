@@ -223,6 +223,7 @@ class NLFPredict:
             },
             "optional": {
                 "per_batch": ("INT", {"default": -1, "min": -1, "max": 10000, "step": 1, "tooltip": "How many images to process at once. -1 means all at once."}),
+                "isExecute": ("BOOLEAN", {"default": True, "tooltip": "If False, skip execution and return None values."}),
             }
         }
 
@@ -231,7 +232,10 @@ class NLFPredict:
     FUNCTION = "predict"
     CATEGORY = "WanVideoWrapper"
 
-    def predict(self, model, images, per_batch=-1):
+    def predict(self, model, images, per_batch=-1, isExecute=True):
+        # Early return if execution is disabled
+        if not isExecute:
+            return (None, None)
 
         check_jit_script_function()
         model = model.to(device)
